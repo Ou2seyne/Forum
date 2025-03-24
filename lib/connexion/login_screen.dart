@@ -57,13 +57,7 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   }
 
   Future<void> _login() async {
-    print("Email: '${_emailController.text}', Password: '${_passwordController.text}'");
-    print("Form key state: ${_formKey.currentState}");
-    if (_formKey.currentState == null) {
-      _showErrorSnackbar("Erreur interne du formulaire");
-      return;
-    }
-    if (!_formKey.currentState!.validate()) {
+    if (_formKey.currentState?.validate() != true) {
       String errorMessage = "";
       if (_emailController.text.isEmpty && _passwordController.text.isEmpty) {
         errorMessage = "Veuillez entrer votre email et mot de passe";
@@ -79,7 +73,6 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
     setState(() => _isLoggingIn = true);
 
     try {
-      print("Sending request...");
       final response = await http.post(
         Uri.parse("https://s3-4662.nuage-peda.fr/forum2/api/authentication_token"),
         headers: {'Content-Type': 'application/json'},
@@ -89,26 +82,21 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
         }),
       );
 
-      print("Response status: ${response.statusCode}");
-      print("Response body: ${response.body}");
+      debugPrint("Login response: ${response.statusCode} - ${response.body}");
 
       if (response.statusCode == 200) {
         final result = json.decode(response.body);
-        if (result == null || result['token'] == null) {
-          throw Exception("Invalid response: token missing");
+        if (result['token'] == null) {
+          throw Exception("Token missing in response");
         }
         await _storeUserData(result);
         if (!mounted) return;
-        Navigator.pushNamedAndRemoveUntil(
-    context,
-    '/',
-    (Route<dynamic> route) => false, // Removes all previous routes
-  );
+        Navigator.pushNamedAndRemoveUntil(context, '/', (route) => false);
       } else {
         _showErrorSnackbar("Identifiants incorrects. Veuillez réessayer.");
       }
     } catch (e) {
-      print("Login error: $e");
+      debugPrint("Login error: $e");
       _showErrorSnackbar("Erreur de connexion: $e");
     } finally {
       if (mounted) setState(() => _isLoggingIn = false);
@@ -116,20 +104,45 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   }
 
   Future<void> _storeUserData(Map<String, dynamic> result) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('token', result['token']);
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString('token', result['token']);
 
-    if (result.containsKey('data') && result['data'] != null) {
-      final userData = result['data'] as Map<String, dynamic>;
-      await prefs.setInt('userId', userData['id']);
-      await prefs.setString('userFirstName', userData['prenom'] ?? '');
-      await prefs.setString('userLastName', userData['nom'] ?? '');
-      final roles = (userData['roles'] as List<dynamic>?)?.map((role) => role.toString()).toList() ?? [];
-      await prefs.setStringList('userRoles', roles);
+  List<String> roles = [];
+  int? userId;
+  if (result.containsKey('data') && result['data'] != null) {
+    final userData = result['data'] as Map<String, dynamic>;
+    userId = int.tryParse(userData['id']?.toString() ?? ''); // Safely parse id
+    if (userId != null) {
+      await prefs.setInt('userId', userId);
     } else {
-      debugPrint("Erreur : Les données utilisateur sont absentes !");
+      debugPrint("Warning: userId is null or unparsable in userData: $userData");
+    }
+    await prefs.setString('userFirstName', userData['prenom'] ?? '');
+    await prefs.setString('userLastName', userData['nom'] ?? '');
+    roles = (userData['roles'] as List<dynamic>?)?.map((role) => role.toString()).toList() ?? [];
+  } else {
+    debugPrint("No user data in response, fetching separately...");
+    final token = result['token'];
+    final userResponse = await http.get(
+      Uri.parse('https://s3-4662.nuage-peda.fr/forum2/api/users/me'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    if (userResponse.statusCode == 200) {
+      final userData = json.decode(userResponse.body);
+      userId = int.tryParse(userData['id']?.toString() ?? '');
+      if (userId != null) {
+        await prefs.setInt('userId', userId);
+      } else {
+        debugPrint("Warning: userId is null or unparsable in fetched userData: $userData");
+      }
+      roles = (userData['roles'] as List<dynamic>?)?.map((r) => r.toString()).toList() ?? [];
+    } else {
+      debugPrint("Failed to fetch user data: ${userResponse.statusCode} - ${userResponse.body}");
     }
   }
+  await prefs.setStringList('userRoles', roles);
+  debugPrint("Stored userId: $userId, roles: $roles");
+}
 
   void _showErrorSnackbar(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
@@ -145,7 +158,6 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
-    print("Building LoginScreen");
     final theme = Theme.of(context);
     final isDarkMode = theme.brightness == Brightness.dark;
 

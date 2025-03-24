@@ -2,13 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../app_themes.dart'; // Assuming this contains your spacing and color constants
+import '../app_themes.dart';
 
 const Color twitterBlue = Color(0xFF1DA1F2);
 
 class SendMessageModal extends StatefulWidget {
   final Function refreshMessages;
-  final int? parentId; // For parent message when replying
+  final int? parentId;
 
   const SendMessageModal({
     super.key,
@@ -28,6 +28,11 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
   late final Animation<double> _fadeAnimation;
   late final Animation<Offset> _slideAnimation;
   late final Animation<double> _glowAnimation;
+
+  int? _selectedCategoryId;
+  int? _selectedSubCategoryId;
+  List<dynamic> _categories = [];
+  List<dynamic> _subCategories = [];
 
   @override
   void initState() {
@@ -53,6 +58,7 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
       ),
     );
     _animationController.forward();
+    _fetchCategories();
   }
 
   @override
@@ -61,6 +67,62 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
     _titreController.dispose();
     _contenuController.dispose();
     super.dispose();
+  }
+
+  Future<void> _fetchCategories() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+
+    if (token == null) {
+      _showSnackBar("Erreur : utilisateur non authentifié.");
+      return;
+    }
+
+    final response = await http.get(
+      Uri.parse('https://s3-4662.nuage-peda.fr/forum2/api/categories'),
+      headers: {
+        'Authorization': 'Bearer $token',
+      },
+    );
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      print("Fetched categories: $data"); // Debugging statement
+      final List<dynamic> categories = data['hydra:member'];
+      setState(() {
+        _categories = categories;
+      });
+    } else {
+      _showSnackBar("Échec du chargement des catégories : ${response.body}");
+    }
+  }
+
+  Future<void> _fetchSubCategories(int categoryId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+
+    if (token == null) {
+      _showSnackBar("Erreur : utilisateur non authentifié.");
+      return;
+    }
+
+    final response = await http.get(
+      Uri.parse('https://s3-4662.nuage-peda.fr/forum2/api/categories/$categoryId/subcategories'),
+      headers: {
+        'Authorization': 'Bearer $token',
+      },
+    );
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      print("Fetched subcategories: $data"); // Debugging statement
+      setState(() {
+        _subCategories = data; // Directly assign the list
+        _selectedSubCategoryId = null; // Reset subcategory selection
+      });
+    } else {
+      _showSnackBar("Échec du chargement des sous-catégories : ${response.body}");
+    }
   }
 
   Future<bool> _checkUserBlockedStatus() async {
@@ -110,6 +172,8 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
       'messages': [],
       'isDeleted': false,
       if (widget.parentId != null) 'parent': '/forum2/api/messages/${widget.parentId}',
+      if (_selectedCategoryId != null) 'category': '/forum2/api/categories/$_selectedCategoryId',
+      if (_selectedSubCategoryId != null) 'subCategory': '/forum2/api/sub_categories/$_selectedSubCategoryId',
     };
 
     try {
@@ -162,7 +226,7 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)), // Rounded top corners
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
       ),
       child: SingleChildScrollView(
         padding: const EdgeInsets.all(spacingL),
@@ -173,7 +237,6 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Drag handle for bottom sheet
                 Container(
                   width: 40,
                   height: 4,
@@ -252,6 +315,80 @@ class _SendMessageModalState extends State<SendMessageModal> with SingleTickerPr
                         maxLines: 5,
                         validator: (value) => value == null || value.isEmpty ? 'Veuillez entrer du contenu' : null,
                         enabled: !_isLoading,
+                      ),
+                      const SizedBox(height: spacingM),
+                      DropdownButtonFormField<int>(
+                        decoration: InputDecoration(
+                          labelText: "Catégorie",
+                          labelStyle: TextStyle(color: theme.primaryColor.withOpacity(0.8)),
+                          prefixIcon: Icon(Icons.category, color: theme.primaryColor),
+                          filled: true,
+                          fillColor: isDarkMode ? Colors.grey[900]!.withOpacity(0.8) : Colors.grey[100]!.withOpacity(0.5),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide.none,
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(color: theme.primaryColor.withOpacity(0.2)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(color: theme.primaryColor, width: 2),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(vertical: spacingM, horizontal: spacingL),
+                        ),
+                        value: _selectedCategoryId,
+                        items: _categories.map((category) {
+                          return DropdownMenuItem<int>(
+                            value: category['id'],
+                            child: Text(category['name']),
+                          );
+                        }).toList(),
+                        onChanged: (value) {
+                          setState(() {
+                            _selectedCategoryId = value;
+                            _fetchSubCategories(value!);
+                          });
+                        },
+                        validator: (value) => value == null ? 'Veuillez sélectionner une catégorie' : null,
+                      ),
+                      const SizedBox(height: spacingM),
+                      DropdownButtonFormField<int>(
+                        decoration: InputDecoration(
+                          labelText: "Sous-Catégorie",
+                          labelStyle: TextStyle(color: theme.primaryColor.withOpacity(0.8)),
+                          prefixIcon: Icon(Icons.category, color: theme.primaryColor),
+                          filled: true,
+                          fillColor: isDarkMode ? Colors.grey[900]!.withOpacity(0.8) : Colors.grey[100]!.withOpacity(0.5),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide.none,
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(color: theme.primaryColor.withOpacity(0.2)),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(20),
+                            borderSide: BorderSide(color: theme.primaryColor, width: 2),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(vertical: spacingM, horizontal: spacingL),
+                        ),
+                        value: _selectedSubCategoryId,
+                        items: _subCategories.map((subCategory) {
+                          print("SubCategory: ${subCategory['name']}, ID: ${subCategory['id']}");
+                          return DropdownMenuItem<int>(
+                            value: subCategory['id'],
+                            child: Text(subCategory['name']),
+                          );
+                        }).toList(),
+                        onChanged: (value) {
+                          setState(() {
+                            _selectedSubCategoryId = value;
+                          });
+                        },
+                        validator: (value) => value == null ? 'Veuillez sélectionner une sous-catégorie' : null,
                       ),
                       const SizedBox(height: spacingL),
                       SizedBox(

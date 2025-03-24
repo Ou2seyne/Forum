@@ -51,9 +51,8 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerProviderStateMixin {
-  List<dynamic> messages = [];
-  List<dynamic> filteredMessages = [];
-  String searchQuery = "";
+  Map<String, dynamic> categorizedMessages = {}; // {categoryName: {subCategoryName: [messages]}}
+  List<dynamic> allMessages = [];
   bool isLoading = true;
   bool isLoggedIn = false;
   bool isAdmin = false;
@@ -91,9 +90,6 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
     );
     _animationController.forward();
     _initPrefs();
-    loadMessages();
-    _loadCurrentUserId();
-    _checkDarkMode();
   }
 
   @override
@@ -123,36 +119,66 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
   Future<void> _initPrefs() async {
     _prefs = await SharedPreferences.getInstance();
     _checkLoginStatus();
+    if (isLoggedIn) {
+      await _loadCurrentUserId();
+      await loadMessages();
+    } else {
+      _redirectToLogin();
+    }
+    _checkDarkMode();
   }
 
   void _checkLoginStatus() async {
-    final prefs = await SharedPreferences.getInstance();
-    final token = prefs.getString('token');
-    final roles = prefs.getStringList('userRoles') ?? [];
-
+    final token = _prefs?.getString('token');
+    final roles = _prefs?.getStringList('userRoles') ?? [];
     setState(() {
-      isLoggedIn = token != null;
+      isLoggedIn = token != null && token.isNotEmpty;
       isAdmin = roles.contains("ROLE_ADMIN");
     });
   }
 
   void _checkDarkMode() async {
-    final prefs = await SharedPreferences.getInstance();
     setState(() {
-      isDarkMode = prefs.getBool('isDarkMode') ?? false;
+      isDarkMode = _prefs?.getBool('isDarkMode') ?? false;
+    });
+  }
+
+  void _redirectToLogin() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      Navigator.pushReplacementNamed(context, '/login');
     });
   }
 
   Future<void> loadMessages() async {
     try {
       setState(() => isLoading = true);
-      List<dynamic> allMessages = [];
+
+      final token = _prefs?.getString('token');
+      if (token == null || token.isEmpty) {
+        throw Exception('No valid authentication token found');
+      }
+
+      // Fetch categories
+      final categoriesResponse = await http.get(
+        Uri.parse('$_baseApiUrl/categories'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      if (categoriesResponse.statusCode != 200) {
+        throw Exception('Failed to load categories: ${categoriesResponse.body}');
+      }
+      final categoriesData = json.decode(categoriesResponse.body);
+      final List<dynamic> categories = categoriesData['hydra:member'];
+
+      // Log categories
+      debugPrint('Fetched Categories: $categories');
+
+      // Fetch all messages
+      List<dynamic> allMessagesTemp = [];
       String url = "$_baseApiUrl/messages";
       bool hasMore = true;
 
       while (hasMore) {
-        final response = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 10));
-
+        final response = await http.get(Uri.parse(url), headers: {'Authorization': 'Bearer $token'}).timeout(const Duration(seconds: 10));
         if (response.statusCode == 200) {
           final Map<String, dynamic> data = json.decode(response.body);
           List<dynamic> msgs = data["hydra:member"] ?? [];
@@ -161,12 +187,15 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
             msg["id"] = int.parse(msg["id"].toString());
             msg["datePoste"] = msg["datePoste"]?.toString();
             msg["dateModification"] = msg["dateModification"]?.toString();
+
+            // Handle user field
             if (msg["user"] is Map<String, dynamic>) {
-              final userIri = msg["user"]["@id"]?.toString() ?? '';
-              msg["userId"] = int.tryParse(userIri.split('/').last);
+              msg["userId"] = int.tryParse(msg["user"]["@id"]?.toString().split('/').last ?? '');
             } else if (msg["user"] is String) {
-              msg["userId"] = int.tryParse(msg["user"].split('/').last);
+              msg["userId"] = int.tryParse(msg["user"].toString().split('/').last);
             }
+
+            // Handle parent field
             if (msg["parent"] is String) {
               msg["parentId"] = int.tryParse(msg["parent"].toString().split('/').last);
             } else if (msg["parent"] is Map<String, dynamic>) {
@@ -174,38 +203,104 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
             } else {
               msg["parentId"] = null;
             }
+
+            // Handle category field
+            if (msg["category"] is String) {
+              msg["categoryId"] = msg["category"].toString().extractIdFromIri();
+            } else if (msg["category"] is Map<String, dynamic>) {
+              msg["categoryId"] = msg["category"]["id"];
+            } else {
+              msg["categoryId"] = null;
+            }
+
+            // Handle subCategory field
+            if (msg["subCategory"] is String) {
+              msg["subCategoryId"] = msg["subCategory"].toString().extractIdFromIri();
+            } else if (msg["subCategory"] is Map<String, dynamic>) {
+              msg["subCategoryId"] = msg["subCategory"]["id"];
+            } else {
+              msg["subCategoryId"] = null;
+            }
+
+            // Log the extracted IDs for debugging
+            debugPrint('Message ID: ${msg["id"]}, Category ID: ${msg["categoryId"]}, SubCategory ID: ${msg["subCategoryId"]}');
+
             return msg;
           }).toList();
 
-          allMessages.addAll(msgs);
+          allMessagesTemp.addAll(msgs);
           hasMore = data["hydra:next"] != null;
           if (hasMore) {
             url = data["hydra:next"];
           }
         } else {
-          throw Exception('Failed to load messages');
+          throw Exception('Failed to load messages: ${response.body}');
         }
       }
 
-      final parentMessages = allMessages.where((msg) => msg["parentId"] == null).toList();
+      // Filter parent messages and calculate reply counts
+      final parentMessages = allMessagesTemp.where((msg) => msg["parentId"] == null).toList();
       for (var parent in parentMessages) {
-        parent["replyCount"] = allMessages.where((msg) => msg["parentId"] == parent["id"]).length;
+        parent["replyCount"] = allMessagesTemp.where((msg) => msg["parentId"] == parent["id"]).length;
       }
 
-      parentMessages.sort((a, b) => DateTime.parse(b["datePoste"]).compareTo(DateTime.parse(a["datePoste"])));
+      // Group messages by category and subcategory
+      Map<String, dynamic> tempCategorizedMessages = {};
+      for (var category in categories) {
+        final categoryId = category['id'];
+        final categoryName = category['name'];
+        tempCategorizedMessages[categoryName] = {};
 
-      if (parentMessages.isEmpty) {
-        _showErrorSnackbar('Aucun message trouvé');
+        // Fetch subcategories for this category
+        final subCategoriesResponse = await http.get(
+          Uri.parse('$_baseApiUrl/categories/$categoryId/subcategories'),
+          headers: {'Authorization': 'Bearer $token'},
+        );
+        if (subCategoriesResponse.statusCode == 200) {
+          final subCategories = json.decode(subCategoriesResponse.body);
+          // Log subcategories
+          debugPrint('Fetched SubCategories for Category $categoryName: $subCategories');
+
+          for (var subCategory in subCategories) {
+            final subCategoryId = subCategory['id'];
+            final subCategoryName = subCategory['name'];
+            final categoryMessages = parentMessages
+                .where((msg) => msg["categoryId"] == categoryId && msg["subCategoryId"] == subCategoryId)
+                .toList();
+            categoryMessages.sort((a, b) => DateTime.parse(b["datePoste"]).compareTo(DateTime.parse(a["datePoste"])));
+            tempCategorizedMessages[categoryName][subCategoryName] = categoryMessages;
+          }
+        }
+
+        // Handle messages without subcategories
+        final uncategorizedMessages = parentMessages
+            .where((msg) => msg["categoryId"] == categoryId && msg["subCategoryId"] == null)
+            .toList();
+        uncategorizedMessages.sort((a, b) => DateTime.parse(b["datePoste"]).compareTo(DateTime.parse(a["datePoste"])));
+        if (uncategorizedMessages.isNotEmpty) {
+          tempCategorizedMessages[categoryName]['Sans sous-catégorie'] = uncategorizedMessages;
+        }
       }
+
+      // Handle uncategorized messages
+      final uncategorized = parentMessages.where((msg) => msg["categoryId"] == null).toList();
+      uncategorized.sort((a, b) => DateTime.parse(b["datePoste"]).compareTo(DateTime.parse(a["datePoste"])));
+      if (uncategorized.isNotEmpty) {
+        tempCategorizedMessages['Sans catégorie'] = {'Sans sous-catégorie': uncategorized};
+      }
+
+      // Log the final categorized messages
+      debugPrint('Categorized Messages: $tempCategorizedMessages');
 
       setState(() {
-        messages = parentMessages;
-        filteredMessages = parentMessages;
+        allMessages = allMessagesTemp;
+        categorizedMessages = tempCategorizedMessages;
         isLoading = false;
       });
     } catch (e) {
       setState(() => isLoading = false);
-      _showErrorSnackbar('Erreur lors du chargement des messages');
+      _showErrorSnackbar('Erreur lors du chargement des messages: $e');
+      _redirectToLogin();
     }
   }
 
@@ -259,8 +354,11 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
 
       if (response.statusCode == 204 || response.statusCode == 200) {
         setState(() {
-          messages.removeWhere((msg) => msg["id"] == messageId);
-          filteredMessages = List.from(messages);
+          categorizedMessages.forEach((category, subCategories) {
+            subCategories.forEach((subCategory, messages) {
+              messages.removeWhere((msg) => msg["id"] == messageId);
+            });
+          });
         });
         _showErrorSnackbar("Message supprimé avec succès", Colors.green);
         Navigator.of(context).pop();
@@ -295,16 +393,19 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
       if (response.statusCode == 200) {
         final updatedMessage = jsonDecode(response.body);
         setState(() {
-          final index = messages.indexWhere((msg) => msg["id"] == messageId);
-          if (index != -1) {
-            messages[index] = {
-              ...messages[index],
-              'titre': titre,
-              'contenu': contenu,
-              'dateModification': updatedMessage['dateModification'],
-            };
-            filteredMessages = List.from(messages);
-          }
+          categorizedMessages.forEach((category, subCategories) {
+            subCategories.forEach((subCategory, messages) {
+              final index = messages.indexWhere((msg) => msg["id"] == messageId);
+              if (index != -1) {
+                messages[index] = {
+                  ...messages[index],
+                  'titre': titre,
+                  'contenu': contenu,
+                  'dateModification': updatedMessage['dateModification'],
+                };
+              }
+            });
+          });
         });
         _showErrorSnackbar('Message mis à jour avec succès', Colors.green);
       }
@@ -324,6 +425,10 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
       });
       Navigator.pushReplacementNamed(context, '/');
     }
+  }
+
+  void toggleTheme() {
+    Provider.of<ThemeProvider>(context, listen: false).toggleTheme();
   }
 
   @override
@@ -400,67 +505,52 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
                         ),
                       ],
                     ),
-                    Row(
-                      children: [
-                        IconButton(
-                          icon: const Icon(Icons.search, size: 26),
-                          color: theme.primaryColor,
-                          onPressed: () => showSearch(
-                            context: context,
-                            delegate: MessageSearchDelegate(allMessages: messages),
-                          ),
-                        ),
-                        if (isLoggedIn) ...[
-                          IconButton(
-                            icon: const Icon(Icons.person, size: 26), // Profile button
-                            color: theme.primaryColor,
-                            onPressed: () => Navigator.pushNamed(context, '/profile'),
-                            tooltip: 'Profil',
-                          ),
-                          if (isAdmin)
-                            IconButton(
-                              icon: const Icon(Icons.admin_panel_settings, size: 26),
-                              color: theme.primaryColor,
-                              onPressed: () => Navigator.pushNamed(context, '/admin'),
-                              tooltip: 'Admin',
-                            ),
-                          IconButton(
-                            icon: Icon(
-                              isDarkMode ? Icons.dark_mode : Icons.light_mode,
-                              size: 26,
-                            ),
-                            color: theme.primaryColor,
-                            onPressed: () => Provider.of<ThemeProvider>(context, listen: false).toggleTheme(),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.logout, size: 26),
-                            color: theme.primaryColor,
-                            onPressed: _logout,
-                          ),
-                        ] else ...[
-                          TextButton(
-                            onPressed: () => Navigator.pushNamed(context, '/login'),
-                            child: Text(
-                              "Connexion",
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.primaryColor,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                          TextButton(
-                            onPressed: () => Navigator.pushNamed(context, '/register'),
-                            child: Text(
-                              "Inscription",
-                              style: theme.textTheme.bodyMedium?.copyWith(
-                                color: theme.primaryColor,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
+                   SingleChildScrollView(
+  scrollDirection: Axis.horizontal,
+  child: Row(
+    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    children: [
+      IconButton(
+        icon: const Icon(Icons.search, size: 26),
+        color: Theme.of(context).primaryColor,
+        onPressed: () => showSearch(context: context, delegate: MessageSearchDelegate(allMessages: allMessages)),
+      ),
+      if (isLoggedIn) ...[
+        IconButton(
+          icon: const Icon(Icons.person, size: 26),
+          color: Theme.of(context).primaryColor,
+          onPressed: () => Navigator.pushNamed(context, '/profile'),
+        ),
+        if (isAdmin)
+          IconButton(
+            icon: const Icon(Icons.admin_panel_settings, size: 26),
+            color: Theme.of(context).primaryColor,
+            tooltip: 'Admin Panel',
+            onPressed: () => Navigator.pushNamed(context, '/admin'),
+          ),
+        IconButton(
+          icon: Icon(isDarkMode ? Icons.dark_mode : Icons.light_mode, size: 26),
+          color: Theme.of(context).primaryColor,
+          onPressed: () => toggleTheme(),
+        ),
+        IconButton(
+          icon: const Icon(Icons.logout, size: 26),
+          color: Theme.of(context).primaryColor,
+          onPressed: () => _logout(),
+        ),
+      ] else ...[
+        TextButton(
+          onPressed: () => Navigator.pushNamed(context, '/login'),
+          child: const Text("Connexion"),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pushNamed(context, '/register'),
+          child: const Text("Inscription"),
+        ),
+      ],
+    ],
+  ),
+),
                   ],
                 ),
               ),
@@ -474,7 +564,7 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
                     : RefreshIndicator(
                         color: theme.primaryColor,
                         onRefresh: loadMessages,
-                        child: filteredMessages.isEmpty
+                        child: categorizedMessages.isEmpty
                             ? SlideTransition(
                                 position: _slideAnimation,
                                 child: FadeTransition(
@@ -497,15 +587,45 @@ class _HomeScreenState extends State<HomeScreen> with RouteAware, SingleTickerPr
                             : ListView.builder(
                                 physics: const BouncingScrollPhysics(),
                                 padding: const EdgeInsets.all(spacingM),
-                                itemCount: filteredMessages.length,
+                                itemCount: categorizedMessages.keys.length,
                                 itemBuilder: (context, index) {
-                                  final message = filteredMessages[index];
-                                  return SlideTransition(
-                                    position: _slideAnimation,
-                                    child: FadeTransition(
-                                      opacity: _fadeAnimation,
-                                      child: _buildMessageCard(message, theme),
+                                  final categoryName = categorizedMessages.keys.elementAt(index);
+                                  final subCategories = categorizedMessages[categoryName];
+                                  return ExpansionTile(
+                                    leading: Icon(Icons.category, color: theme.primaryColor),
+                                    title: Text(
+                                      categoryName,
+                                      style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
                                     ),
+                                    children: subCategories.keys.map<Widget>((subCategoryName) {
+                                      final messages = subCategories[subCategoryName];
+                                      return ExpansionTile(
+                                        leading: Icon(Icons.subdirectory_arrow_right, color: theme.primaryColor),
+                                        title: Text(
+                                          subCategoryName,
+                                          style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                                        ),
+                                        children: messages.isEmpty
+                                            ? [
+                                                Padding(
+                                                  padding: const EdgeInsets.all(spacingM),
+                                                  child: Text(
+                                                    'Aucun message dans cette sous-catégorie',
+                                                    style: theme.textTheme.bodyMedium,
+                                                  ),
+                                                ),
+                                              ]
+                                            : messages.map<Widget>((message) {
+                                                return SlideTransition(
+                                                  position: _slideAnimation,
+                                                  child: FadeTransition(
+                                                    opacity: _fadeAnimation,
+                                                    child: _buildMessageCard(message, theme),
+                                                  ),
+                                                );
+                                              }).toList(),
+                                      );
+                                    }).toList(),
                                   );
                                 },
                               ),

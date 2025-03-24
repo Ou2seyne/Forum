@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
-import '../app_themes.dart'; // Assuming this contains spacing and color constants
+import '../app_themes.dart';
 
 const String _baseApiUrl = 'https://s3-4662.nuage-peda.fr/forum2/api';
 
@@ -60,31 +60,53 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
   }
 
   Future<void> _loadUsers() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final token = prefs.getString('token');
-      if (token == null) {
-        Navigator.pushReplacementNamed(context, '/login');
-        return;
-      }
-      final response = await http.get(
-        Uri.parse('$_baseApiUrl/users'),
-        headers: {'Authorization': 'Bearer $token'},
-      );
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        setState(() {
-          users = data['hydra:member'];
-          isLoading = false;
-        });
-      } else {
-        throw Exception('Failed to load users');
-      }
-    } catch (e) {
-      setState(() => isLoading = false);
-      _showSnackBar('Erreur: ${e.toString()}');
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+    if (token == null) {
+      Navigator.pushReplacementNamed(context, '/login');
+      return;
     }
+    final response = await http.get(
+      Uri.parse('$_baseApiUrl/users'),
+      headers: {'Authorization': 'Bearer $token'},
+    );
+    debugPrint("Users API Response: ${response.statusCode} - ${response.body}");
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      if (data['hydra:member'] == null) {
+        throw Exception('No hydra:member found in response');
+      }
+      setState(() {
+        users = data['hydra:member'];
+        isLoading = false;
+      });
+    } else {
+      String errorMessage;
+      switch (response.statusCode) {
+        case 401:
+          errorMessage = 'Non autorisé: Token invalide ou expiré';
+          Navigator.pushReplacementNamed(context, '/login');
+          break;
+        case 403:
+          errorMessage = 'Accès interdit: Permissions insuffisantes';
+          break;
+        case 404:
+          errorMessage = 'Endpoint non trouvé';
+          break;
+        case 500:
+          errorMessage = 'Erreur serveur: ${response.body}';
+          break;
+        default:
+          errorMessage = 'Erreur ${response.statusCode}: ${response.body}';
+      }
+      throw Exception(errorMessage);
+    }
+  } catch (e) {
+    setState(() => isLoading = false);
+    _showSnackBar('Failed to load users: $e');
   }
+}
 
   Future<void> _toggleUserBlockStatus(int userId, bool isBlocked) async {
     try {
@@ -106,6 +128,7 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
         Uri.parse(url),
         headers: {'Authorization': 'Bearer $token'},
       );
+      debugPrint("Toggle Block Response: ${response.statusCode} - ${response.body}");
       if (response.statusCode == 200) {
         setState(() {
           final index = users.indexWhere((u) => u['id'] == userId);
@@ -119,7 +142,7 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
         _showSnackBar('Erreur: ${errorData['message'] ?? 'Erreur inconnue'}');
       }
     } catch (e) {
-      _showSnackBar('Erreur lors de la mise à jour du statut');
+      _showSnackBar('Erreur lors de la mise à jour du statut: $e');
     }
   }
 
@@ -131,7 +154,7 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
     if (id != null && roles != null) {
       setState(() {
         userId = id;
-        userRole = roles.isNotEmpty ? roles.first : 'Aucun rôle attribué';
+        userRole = roles.contains('ROLE_ADMIN') ? 'ROLE_ADMIN' : roles.isNotEmpty ? roles.first : 'Aucun rôle';
       });
     }
   }
@@ -250,8 +273,14 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
                         position: _slideAnimation,
                         child: FadeTransition(
                           opacity: _fadeAnimation,
-                          child: userId != null && userRole != null
-                              ? ListView.builder(
+                          child: users.isEmpty
+                              ? const Center(
+                                  child: Text(
+                                    'Aucun utilisateur trouvé ou accès refusé',
+                                    style: TextStyle(fontSize: 18),
+                                  ),
+                                )
+                              : ListView.builder(
                                   controller: _scrollController,
                                   padding: const EdgeInsets.all(spacingM),
                                   itemCount: users.length,
@@ -262,12 +291,6 @@ class _AdminPanelState extends State<AdminPanel> with SingleTickerProviderStateM
                                       onBlockToggle: (isBlocked) => _toggleUserBlockStatus(user['id'], isBlocked),
                                     );
                                   },
-                                )
-                              : const Center(
-                                  child: Text(
-                                    'Veuillez vous connecter en tant qu’admin',
-                                    style: TextStyle(fontSize: 18),
-                                  ),
                                 ),
                         ),
                       ),

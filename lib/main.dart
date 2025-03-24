@@ -44,10 +44,10 @@ class AppWrapper extends StatelessWidget {
       themeMode: themeProvider.isDarkMode ? ThemeMode.dark : ThemeMode.light,
       initialRoute: '/',
       routes: {
-        '/': (context) => const HomeWrapper(), // Always start with HomeWrapper
+        '/': (context) => const HomeWrapper(),
         '/login': (context) => const LoginScreen(),
         '/register': (context) => const RegisterScreen(),
-        '/admin': (context) => const AdminPanel(),
+        '/admin': (context) => const AdminWrapper(),
         '/profile': (context) => const ProfileWrapper(),
       },
       onGenerateRoute: (settings) {
@@ -74,8 +74,7 @@ class HomeWrapper extends StatelessWidget {
             body: Center(child: CircularProgressIndicator()),
           );
         }
-        final userId = snapshot.data; // userId can be null if not logged in
-        // Always show HomeScreen, passing userId (null if not logged in)
+        final userId = snapshot.data;
         return HomeScreen(userId: userId);
       },
     );
@@ -96,12 +95,51 @@ class ProfileWrapper extends StatelessWidget {
           );
         }
         final userId = snapshot.data;
-        // Require login for profile, redirect to LoginScreen if not logged in
-        return userId != null
-            ? ProfileScreen(userId: userId)
-            : const LoginScreen();
+        return userId != null ? ProfileScreen(userId: userId) : const LoginScreen();
       },
     );
+  }
+}
+
+class AdminWrapper extends StatelessWidget {
+  const AdminWrapper({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>>(
+      future: _checkUserStatus(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        final userData = snapshot.data;
+        if (userData == null || !userData['isLoggedIn']) {
+          return const LoginScreen();
+        }
+        if (!userData['isAdmin']) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Accès réservé aux administrateurs')),
+            );
+            Navigator.pushReplacementNamed(context, '/');
+          });
+          return const HomeWrapper();
+        }
+        return const AdminPanel();
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>> _checkUserStatus() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token');
+    final roles = prefs.getStringList('userRoles') ?? [];
+    return {
+      'isLoggedIn': token != null && token.isNotEmpty,
+      'isAdmin': roles.contains('ROLE_ADMIN'),
+    };
   }
 }
 
